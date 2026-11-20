@@ -38,6 +38,7 @@ flowchart LR
 ```
 
 ---
+![Local Cluster Architecture](docs/local-architecture-diagram.png)
 
 ## 🧩 Core Components
 
