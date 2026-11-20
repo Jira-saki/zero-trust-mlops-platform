@@ -1,0 +1,213 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: mlops
+  labels:
+    app.kubernetes.io/part-of: mlops-platform
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: minio-creds
+  namespace: mlops
+type: Opaque
+stringData:
+  MINIO_ROOT_USER: "minioadmin"
+  MINIO_ROOT_PASSWORD: "minioadmin123"
+  AWS_ACCESS_KEY_ID: "minioadmin"
+  AWS_SECRET_ACCESS_KEY: "minioadmin123"
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: minio-pvc
+  namespace: mlops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mlflow-db-pvc
+  namespace: mlops
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 2Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  namespace: mlops
+  labels:
+    app: minio
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: minio
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+        - name: minio
+          image: cgr.dev/chainguard/minio:latest
+          args:
+            - server
+            - /data
+            - --console-address
+            - ":9001"
+          envFrom:
+            - secretRef:
+                name: minio-creds
+          ports:
+            - name: api
+              containerPort: 9000
+            - name: console
+              containerPort: 9001
+          volumeMounts:
+            - name: data
+              mountPath: /data
+          readinessProbe:
+            httpGet:
+              path: /minio/health/ready
+              port: 9000
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /minio/health/live
+              port: 9000
+            initialDelaySeconds: 15
+            periodSeconds: 20
+      volumes:
+        - name: data
+          persistentVolumeClaim:
+            claimName: minio-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio
+  namespace: mlops
+spec:
+  selector:
+    app: minio
+  ports:
+    - name: api
+      port: 9000
+      targetPort: 9000
+    - name: console
+      port: 9001
+      targetPort: 9001
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: minio-create-bucket
+  namespace: mlops
+spec:
+  ttlSecondsAfterFinished: 300
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: aws-cli
+          image: public.ecr.aws/aws-cli/aws-cli:latest
+          env:
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-1"
+          envFrom:
+            - secretRef:
+                name: minio-creds
+          command:
+            - /bin/sh
+            - -c
+            - |
+              until aws --endpoint-url http://minio.mlops.svc.cluster.local:9000 s3 ls; do
+                echo "Waiting for MinIO..."
+                sleep 3
+              done
+              aws --endpoint-url http://minio.mlops.svc.cluster.local:9000 s3 mb s3://mlflow-artifacts || true
+              echo "Bucket mlflow-artifacts is ready!"
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: mlflow
+  namespace: mlops
+  labels:
+    app: mlflow
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: mlflow
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: mlflow
+    spec:
+      containers:
+        - name: mlflow
+          image: ghcr.io/mlflow/mlflow:latest
+          command:
+            - /bin/sh
+            - -c
+            - |
+              pip install --no-cache-dir -q boto3 && \
+              mlflow server \
+                --backend-store-uri sqlite:////mlflow/mlflow.db \
+                --default-artifact-root s3://mlflow-artifacts \
+                --host 0.0.0.0 \
+                --port 5000
+          env:
+            - name: MLFLOW_S3_ENDPOINT_URL
+              value: "http://minio.mlops.svc.cluster.local:9000"
+            - name: AWS_DEFAULT_REGION
+              value: "us-east-1"
+          envFrom:
+            - secretRef:
+                name: minio-creds
+          ports:
+            - name: http
+              containerPort: 5000
+          volumeMounts:
+            - name: mlflow-db
+              mountPath: /mlflow
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: 5000
+            initialDelaySeconds: 15
+            periodSeconds: 10
+      volumes:
+        - name: mlflow-db
+          persistentVolumeClaim:
+            claimName: mlflow-db-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: mlflow
+  namespace: mlops
+spec:
+  selector:
+    app: mlflow
+  ports:
+    - name: http
+      port: 5000
+      targetPort: 5000
